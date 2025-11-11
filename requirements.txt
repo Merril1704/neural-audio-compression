@@ -1,0 +1,9 @@
+torch
+torchaudio
+soundfile
+librosa
+scipy
+pystoi
+pesq
+pandas
+matplotlib

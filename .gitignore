@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+.Python
+venv/
+env/
+.venv/
+.conda/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Editors/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Caches
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Project outputs and local data
+output/
+dataset/
+research png/
+
+# Large/binary artifacts
+*.pt
+*.pth
+*.onnx
+
+# OS junk
+.DS_Store
+Thumbs.db
