@@ -155,7 +155,16 @@ def quantize_indices_uniform(x: torch.Tensor, bits: int) -> Tuple[torch.Tensor, 
     q = torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
     idx = torch.round(q * (L - 1)).to(torch.int64)
     idx = idx.clamp(0, L - 1)
-    x_hat = centers.to(x.device)[idx]
+    # Use a flattened index to avoid advanced-index edge-cases that can trigger
+    # internal broadcasts/expand calls in some torch versions/devices.
+    centers_dev = centers.to(x.device)
+    flat_idx = idx.flatten()
+    if flat_idx.numel() == 0:
+        # empty input -> return matching empty tensors
+        x_hat = idx.new_empty(idx.shape, dtype=centers_dev.dtype)
+    else:
+        vals = centers_dev[flat_idx]
+        x_hat = vals.view(idx.shape)
     return idx, x_hat
 
 
@@ -186,17 +195,26 @@ def adpcm_encode_decode(x: torch.Tensor, bits: int) -> torch.Tensor:
     x_hat = torch.zeros_like(x)
     prev = torch.tensor(0.0, dtype=x.dtype, device=x.device)
     r = torch.empty_like(x)
-    r[0] = x[0] - prev
+    # First residual
+    if T > 0:
+        r[0] = x[0] - prev
     for n in range(1, T):
         r[n] = x[n] - x_hat[n-1]
     rmax = torch.max(torch.abs(r))
     rmax = torch.nan_to_num(rmax, nan=0.0) + 1e-8
-    # Quantize residuals to [-1,1] then scale by rmax
+    # Normalize residuals to [-1,1]
     r_norm = torch.clamp(torch.nan_to_num(r / rmax, nan=0.0), -1.0, 1.0)
-    idx, r_hat_norm = quantize_indices_uniform(r_norm, bits)
+    # Quantize residuals using arithmetic (avoid advanced indexing that may
+    # trigger expand/broadcast issues on some torch builds/devices).
+    L = 2 ** bits
+    q = torch.clamp((r_norm + 1.0) * 0.5, 0.0, 1.0)
+    idx = torch.round(q * (L - 1)).to(torch.int64).clamp(0, L - 1)
+    # dequantize normalized residuals back to [-1,1]
+    r_hat_norm = (idx.to(r_norm.dtype) / (L - 1)) * 2.0 - 1.0
     r_hat = r_hat_norm * rmax
     # Reconstruct
-    x_hat[0] = prev + r_hat[0]
+    if T > 0:
+        x_hat[0] = prev + r_hat[0]
     for n in range(1, T):
         x_hat[n] = x_hat[n-1] + r_hat[n]
     return x_hat.unsqueeze(0).unsqueeze(0)
@@ -214,13 +232,10 @@ def adpcm_ulaw_encode_decode(x: torch.Tensor, bits: int, mu: int = 255) -> torch
 
 def snr_db(x: torch.Tensor, x_hat: torch.Tensor, eps: float = 1e-12) -> float:
     """Robust SNR in dB; guards against zero/NaN/Inf to avoid log domain errors."""
-    # Sanitize tensors
     x = torch.nan_to_num(x, nan=0.0)
     x_hat = torch.nan_to_num(x_hat, nan=0.0)
-    # Energies
     num = float(torch.sum(x ** 2).item())
     den = float(torch.sum((x - x_hat) ** 2).item())
-    # Replace non-finite or non-positive with eps
     if not math.isfinite(num) or num <= 0.0:
         num = eps
     if not math.isfinite(den) or den <= 0.0:
@@ -234,7 +249,6 @@ def snr_db(x: torch.Tensor, x_hat: torch.Tensor, eps: float = 1e-12) -> float:
 def segmental_snr_db(x: torch.Tensor, x_hat: torch.Tensor, frame_size: int = 320, hop: int = 160, eps: float = 1e-12) -> float:
     """
     Segmental SNR over short frames (e.g., 20 ms at 16 kHz). Returns average over frames.
-    Robust to silent frames and numerical issues.
     x, x_hat shapes: (1, 1, T)
     """
     x = torch.nan_to_num(x).squeeze(0).squeeze(0)
@@ -249,7 +263,6 @@ def segmental_snr_db(x: torch.Tensor, x_hat: torch.Tensor, frame_size: int = 320
         xhe = xh[start:end]
         num = float(torch.sum(xe ** 2).item())
         den = float(torch.sum((xe - xhe) ** 2).item())
-        # Skip frames with (near) zero signal energy to avoid bias; alternatively clamp
         if not math.isfinite(num):
             num = 0.0
         if not math.isfinite(den):
@@ -368,7 +381,10 @@ def evaluate_condition(
         rmax = torch.max(torch.abs(r))
         rmax = torch.nan_to_num(rmax, nan=0.0) + 1e-8
         r_norm = torch.clamp(torch.nan_to_num(r / rmax, nan=0.0), -1.0, 1.0)
-        idx_stream, _ = quantize_indices_uniform(r_norm.unsqueeze(0).unsqueeze(0), bits)
+        # Quantize residual indices arithmetically to avoid indexing edge-cases
+        L = 2 ** bits
+        q = torch.clamp((r_norm + 1.0) * 0.5, 0.0, 1.0)
+        idx_stream = torch.round(q * (L - 1)).to(torch.int64).clamp(0, L - 1)
     else:  # adpcm_ulaw
         x_hat = adpcm_ulaw_encode_decode(x, bits, mu=mu)
         # Derive residual indices in μ-law domain
@@ -382,7 +398,9 @@ def evaluate_condition(
         rmax = torch.max(torch.abs(r))
         rmax = torch.nan_to_num(rmax, nan=0.0) + 1e-8
         r_norm = torch.clamp(torch.nan_to_num(r / rmax, nan=0.0), -1.0, 1.0)
-        idx_stream, _ = quantize_indices_uniform(r_norm.unsqueeze(0).unsqueeze(0), bits)
+        L = 2 ** bits
+        q = torch.clamp((r_norm + 1.0) * 0.5, 0.0, 1.0)
+        idx_stream = torch.round(q * (L - 1)).to(torch.int64).clamp(0, L - 1)
 
     snr = snr_db(x, x_hat)
     segsnr = segmental_snr_db(x, x_hat)
@@ -420,6 +438,7 @@ def main():
     p.add_argument("--methods", type=str, nargs="+", default=["uniform_pcm", "ulaw_pcm", "adpcm_uniform", "adpcm_ulaw"],
                    help="Methods to run: uniform_pcm ulaw_pcm adpcm_uniform adpcm_ulaw")
     p.add_argument("--save", type=str, default=None, help="Folder to save reconstructions for the last run condition")
+    p.add_argument("--save-all", action="store_true", help="Save reconstructions for every processed condition into --save (or output/last_run_all if --save omitted)")
     p.add_argument("--csv", type=str, default=None, help="Path to write metrics CSV (e.g., output/metrics.csv)")
     args = p.parse_args()
 
@@ -440,6 +459,52 @@ def main():
                 pesq_str = f"{res['pesq']:.3f}" if res['pesq'] is not None else "n/a"
                 print(f"{m:14s} {b:2d}-bit | SNR {res['snr_db']:.2f} dB | SegSNR {res['segsnr_db']:.2f} dB | "
                       f"STOI {stoi_str} | PESQ {pesq_str} | H {res['entropy_bps']/1000:.1f} kbps (nom {res['nominal_bps']/1000:.1f} kbps)")
+                # Optionally save every reconstruction for this condition
+                if args.save_all:
+                    # Determine base folder
+                    base_root = args.save if args.save is not None else os.path.join("output", "last_run_all")
+                    # Use a safe source basename
+                    try:
+                        src_base = os.path.splitext(os.path.basename(str(src_label)))[0]
+                    except Exception:
+                        src_base = str(src_label)
+                    out_dir = os.path.join(base_root, src_base)
+                    os.makedirs(out_dir, exist_ok=True)
+                    # Reconstruct the waveform for saving
+                    try:
+                        xh = None
+                        if m == "uniform_pcm":
+                            _, xh = quantize_indices_uniform(x, b)
+                        elif m == "ulaw_pcm":
+                            y = ulaw_compand(x, mu=args.mu)
+                            _, yh = quantize_indices_uniform(y, b)
+                            xh = ulaw_expand(yh, mu=args.mu)
+                        elif m == "adpcm_uniform":
+                            xh = adpcm_encode_decode(x, b)
+                        else:  # adpcm_ulaw
+                            xh = adpcm_ulaw_encode_decode(x, b, mu=args.mu)
+                    except Exception as e:
+                        print(f"Warning: could not reconstruct for saving {src_label} {m} {b}-bit: {e}")
+                        xh = None
+                    if xh is not None:
+                        # Build filename; include mu for ulaw methods
+                        if "ulaw" in m:
+                            fname = f"{m}_mu{args.mu}_{b}bit.wav"
+                        else:
+                            fname = f"{m}_{b}bit.wav"
+                        dest = os.path.join(out_dir, fname)
+                        # avoid overwriting by finding a unique filename
+                        base, ext = os.path.splitext(dest)
+                        i = 1
+                        unique_dest = dest
+                        while os.path.exists(unique_dest):
+                            unique_dest = f"{base}_{i}{ext}"
+                            i += 1
+                        try:
+                            save_wav(unique_dest, xh, sr)
+                            print("Saved:", os.path.abspath(unique_dest))
+                        except Exception as e:
+                            print(f"Warning: failed to save {unique_dest}: {e}")
 
     # Batch mode: directory of audio files
     if args.wav_dir:
